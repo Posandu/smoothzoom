@@ -2,8 +2,8 @@
 
 A minimal camera app for phones like the Galaxy A56 that expose the ultrawide and main
 cameras as separate Camera2 devices (no native lens switching). It hides the 0.5x ⇄ 1x
-lens switch by freezing the last frame, keeping it zoom-matched while the other lens starts,
-and crossfading once exposure has settled.
+lens switch by snapshotting the last frame on the GPU, keeping it zoom-matched (the zoom never
+pauses) while the other lens starts, and crossfading once exposure has settled.
 
 ## Get the APK (no Android Studio needed)
 1. Create a new GitHub repo and upload everything in this folder (keep `.github/`).
@@ -21,7 +21,11 @@ Or open the folder in Android Studio and press Run.
   size during the switch (Samsung's ultrawide distortion correction can crop the frame a bit).
   The value is saved.
 - Shutter saves JPEGs to `DCIM/SmoothZoom`.
+- **Video:** switch to VIDEO and tap the red button. Recordings (1080p, 30 fps, H.264 + AAC)
+  go to `DCIM/SmoothZoom`. The preview is drawn with OpenGL and the same frames go to the
+  encoder, so a lens switch while recording shows the same smooth transition as the preview.
 
 ## Limits
-- Video isn't supported: a recording would still show the ~0.3–0.5 s gap.
+- During a lens switch the video shows the frozen, zooming frame for ~0.3 s instead of live
+  motion; it never cuts to black or jumps.
 - Photo quality is plain Camera2 output, without Samsung's processing.
