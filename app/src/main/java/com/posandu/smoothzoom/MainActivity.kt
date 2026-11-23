@@ -96,7 +96,9 @@ class MainActivity : Activity() {
     companion object {
         private const val TAG = "SmoothZoom"
         private const val SWITCH_DOWN = 0.97f   // main -> ultrawide below this
-        private const val SWITCH_UP = 1.0f      // ultrawide -> main at/above this
+        private const val SWITCH_UP = 1.0f      // ultrawide -> main at/above this, once zoom is idle
+        private const val SWITCH_UP_MOVING = 1.3f // ultrawide -> main right away while zooming
+        private const val IDLE_MS = 350L        // zoom counts as idle after this long without change
         private const val PREFS = "smoothzoom"
         private const val KEY_UW_BASE = "uw_base"
         private const val ENC_W = 1920
@@ -139,6 +141,12 @@ class MainActivity : Activity() {
 
     // Shared
     @Volatile private var latestZoom = 1f
+    /** True once the zoom has stopped changing; lets the ultrawide -> main switch happen on a still frame. */
+    @Volatile private var zoomIdle = true
+    private val idleRunnable = Runnable {
+        zoomIdle = true
+        cam?.post { camApplyZoom() }
+    }
     @Volatile private var videoMode = false
     @Volatile private var renderer: GlRenderer? = null
     @Volatile private var camTexture: SurfaceTexture? = null
@@ -351,7 +359,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
         }
-        zoomLabel = TextView(this).apply { textSize = 15f; setTextColor(0xFFFFD54F.toInt()) }
+        zoomLabel = TextView(this).apply { textSize = 15f; gravity = Gravity.CENTER; setTextColor(0xFFFFD54F.toInt()) }
         bottom.addView(zoomLabel)
 
         val chipRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
@@ -466,6 +474,9 @@ class MainActivity : Activity() {
         zoomLabel.text = String.format(Locale.US, "%.2fx", zoom)
         renderer?.zoom = zoom
         latestZoom = zoom
+        zoomIdle = false
+        ui.removeCallbacks(idleRunnable)
+        ui.postDelayed(idleRunnable, IDLE_MS)
         val h = cam ?: return
         if (zoomPosted.compareAndSet(false, true)) {
             if (!h.post { zoomPosted.set(false); camApplyZoom() }) zoomPosted.set(false)
@@ -564,7 +575,10 @@ class MainActivity : Activity() {
         val u = uwLens ?: return m
         if (nativeMode) return m
         return if (current === u) {
-            if (z >= SWITCH_UP) m else u
+            // Zooming in from the ultrawide: keep it (digitally cropped) up to 1.3x while the zoom
+            // is moving, and switch once it rests at 1x or more. The swap then happens on a still
+            // picture, where the freeze + crossfade is far less visible than mid-zoom.
+            if (z >= SWITCH_UP_MOVING || (zoomIdle && z >= SWITCH_UP)) m else u
         } else {
             if (z < SWITCH_DOWN) u else m
         }
