@@ -1,8 +1,6 @@
 package com.posandu.smoothzoom
 
 import android.Manifest
-import android.animation.Animator
-import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.Activity
@@ -12,8 +10,6 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.Rect
-import android.graphics.RenderEffect
-import android.graphics.Shader
 import android.graphics.SurfaceTexture
 import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraCaptureSession
@@ -24,12 +20,17 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.media.ImageReader
+import android.media.MediaCodec
+import android.media.MediaRecorder
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.util.Range
@@ -42,15 +43,12 @@ import android.view.View
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.exp
@@ -64,10 +62,13 @@ import kotlin.math.min
  * as separate Camera2 devices (no native logical-camera switching).
  *
  * Only one camera can stream at a time, so at the switch point we:
- *   1. freeze the last preview frame in an overlay,
+ *   1. snapshot the current frame on the GPU (GlRenderer.freeze),
  *   2. close the old lens and open the new one with a crop that matches the field of view,
- *   3. keep scaling the frozen frame with the user's pinch while the new lens starts,
- *   4. wait until auto-exposure settles, then crossfade the overlay away.
+ *   3. keep scaling the snapshot with the zoom while the new lens starts (zoom never pauses),
+ *   4. crossfade the snapshot away once auto-exposure has settled.
+ *
+ * Every frame goes through GlRenderer, which also feeds the video encoder, so recordings
+ * show the same seamless transition.
  *
  * If the phone does expose a logical camera with a zoom range below 1x, the app
  * uses CONTROL_ZOOM_RATIO instead and lets the camera system switch natively.
@@ -80,9 +81,12 @@ class MainActivity : Activity() {
         val activeArray: Rect,
         val maxDigital: Float,
         val sensorOrientation: Int,
-        val previewSize: Size,
+        val photoPreview: Size,
+        val videoPreview: Size,
         val jpegSize: Size,
-        val afContinuous: Boolean,
+        val afPicture: Boolean,
+        val afVideo: Boolean,
+        val fps30: Range<Int>?,
         val nativeZoomRange: Range<Float>?,
     ) {
         /** Zoom level (relative to the main camera) at which this lens shows its full frame. */
@@ -95,6 +99,9 @@ class MainActivity : Activity() {
         private const val SWITCH_UP = 1.0f      // ultrawide -> main at/above this
         private const val PREFS = "smoothzoom"
         private const val KEY_UW_BASE = "uw_base"
+        private const val ENC_W = 1920
+        private const val ENC_H = 1080
+        private const val FADE_MS = 260L
     }
 
     private val manager by lazy { getSystemService(Context.CAMERA_SERVICE) as CameraManager }
@@ -102,11 +109,14 @@ class MainActivity : Activity() {
 
     // Views
     private lateinit var textureView: TextureView
-    private lateinit var overlay: ImageView
     private lateinit var flash: View
     private lateinit var zoomLabel: TextView
     private lateinit var infoLabel: TextView
+    private lateinit var recLabel: TextView
     private lateinit var calibRow: LinearLayout
+    private lateinit var shutter: View
+    private lateinit var photoTab: TextView
+    private lateinit var videoTab: TextView
     private var uwChip: TextView? = null
 
     // Lenses
@@ -118,24 +128,30 @@ class MainActivity : Activity() {
 
     // UI-thread state
     private var zoom = 1f
-    private var snapZoom = 1f
     private var zoomAnimator: ValueAnimator? = null
-    private var fadeAnimator: ValueAnimator? = null
-    private var blurAnimator: ValueAnimator? = null
-    private var afterSwitch: (() -> Unit)? = null
+
+    // Recording (UI thread)
+    private var recorder: MediaRecorder? = null
+    private var recSurface: Surface? = null
+    private var recPfd: ParcelFileDescriptor? = null
+    private var recUri: Uri? = null
+    private var recStart = 0L
 
     // Shared
     @Volatile private var latestZoom = 1f
+    @Volatile private var videoMode = false
+    @Volatile private var renderer: GlRenderer? = null
+    @Volatile private var camTexture: SurfaceTexture? = null
     private val zoomPosted = AtomicBoolean(false)
-    @Volatile private var texture: SurfaceTexture? = null
 
     // Camera-thread state
     private var camThread: HandlerThread? = null
     @Volatile private var cam: Handler? = null
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
+    private var sessionIsVideo = false
     private var previewSurface: Surface? = null
-    private var jpegReader: ImageReader? = null
+    private val jpegReaders = HashMap<String, ImageReader>()
     private var previewBuilder: CaptureRequest.Builder? = null
     private var currentLens: Lens? = null
     private var switching = false
@@ -151,25 +167,29 @@ class MainActivity : Activity() {
         buildUi()
         setZoom(1f)
         updateInfo()
+        updateModeUi()
     }
 
     override fun onResume() {
         super.onResume()
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
+        val missing = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+            .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (Manifest.permission.CAMERA in missing) {
+            requestPermissions(missing.toTypedArray(), 1)
         } else {
             maybeStartCamera()
         }
     }
 
     override fun onPause() {
+        stopRecording()
         stopCamera()
         super.onPause()
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
-        if (results.firstOrNull() == PackageManager.PERMISSION_GRANTED) maybeStartCamera()
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) maybeStartCamera()
         else infoLabel.text = "Camera permission is needed."
     }
 
@@ -223,22 +243,37 @@ class MainActivity : Activity() {
         val equiv = focal * 43.27f / hypot(aw, ah)
 
         val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
-        val prev = pickSize(map.getOutputSizes(SurfaceTexture::class.java), 1920) ?: return null
-        val jpeg = pickSize(map.getOutputSizes(ImageFormat.JPEG), Int.MAX_VALUE) ?: return null
-        val af = c.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
-            ?.contains(CameraCharacteristics.CONTROL_AF_MODE_CONTINUOUS_PICTURE) == true
+        val texSizes = map.getOutputSizes(SurfaceTexture::class.java)
+        val prev = pickSize(texSizes, 1920, 4, 3) ?: return null
+        val vid = pickSize(texSizes, 1920, 16, 9) ?: prev
+        // Cap the JPEG size: the full 50 MP mode makes session setup (and so every lens switch) much slower.
+        val jpeg = pickSize(map.getOutputSizes(ImageFormat.JPEG), 4096, 4, 3) ?: return null
+        val afModes = c.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: IntArray(0)
         val maxD = c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
         val zr = if (Build.VERSION.SDK_INT >= 30) c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) else null
         val orient = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val fps = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.firstOrNull { it.lower == 30 && it.upper == 30 }
 
-        return Lens(id, equiv, active, maxD, orient, prev, jpeg, af, zr)
+        return Lens(
+            id, equiv, active, maxD, orient, prev, vid, jpeg,
+            afModes.contains(CameraCharacteristics.CONTROL_AF_MODE_CONTINUOUS_PICTURE),
+            afModes.contains(CameraCharacteristics.CONTROL_AF_MODE_CONTINUOUS_VIDEO),
+            fps, zr,
+        )
     }
 
-    private fun pickSize(sizes: Array<Size>?, maxW: Int): Size? {
+    private fun pickSize(sizes: Array<Size>?, maxW: Int, rw: Int, rh: Int): Size? {
         if (sizes.isNullOrEmpty()) return null
-        val ok = sizes.filter { it.width <= maxW }
-        val fourThree = ok.filter { it.width * 3 == it.height * 4 }
-        return fourThree.ifEmpty { ok }.maxByOrNull { it.width.toLong() * it.height }
+        val ok = sizes.filter { it.width <= maxW }.ifEmpty { sizes.toList() }
+        val match = ok.filter { it.width * rh == it.height * rw }
+        return match.ifEmpty { ok }.maxByOrNull { it.width.toLong() * it.height }
+    }
+
+    /** Portrait height / width of the preview for this lens in the current mode. */
+    private fun aspectFor(lens: Lens): Float {
+        val s = if (videoMode) lens.videoPreview else lens.photoPreview
+        return s.width.toFloat() / s.height
     }
 
     // ---------------------------------------------------------------- UI
@@ -260,25 +295,22 @@ class MainActivity : Activity() {
     @SuppressLint("ClickableViewAccessibility")
     private fun buildUi() {
         val w = resources.displayMetrics.widthPixels
-        val h = w * 4 / 3
+        val top = dpi(72f)
+        // Tall enough for 16:9 video; photo mode draws a 4:3 picture at the top of it.
+        val h = min(w * 16 / 9, resources.displayMetrics.heightPixels - top)
 
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
 
         val previewBox = FrameLayout(this)
-        root.addView(previewBox, FrameLayout.LayoutParams(w, h, Gravity.TOP).apply { topMargin = dpi(72f) })
+        root.addView(previewBox, FrameLayout.LayoutParams(w, h, Gravity.TOP).apply { topMargin = top })
 
         textureView = TextureView(this)
         previewBox.addView(textureView, FrameLayout.LayoutParams(-1, -1))
-        overlay = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.FIT_XY
-            visibility = View.INVISIBLE
-        }
-        previewBox.addView(overlay, FrameLayout.LayoutParams(-1, -1))
         flash = View(this).apply { setBackgroundColor(Color.WHITE); alpha = 0f }
         previewBox.addView(flash, FrameLayout.LayoutParams(-1, -1))
 
-        // Top: lens info (tap to show FOV calibration)
-        val top = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        // Top: lens info (tap to show FOV calibration), recording timer
+        val topBar = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         infoLabel = TextView(this).apply {
             setTextColor(0xFFAAAAAA.toInt())
             textSize = 11f
@@ -289,7 +321,7 @@ class MainActivity : Activity() {
                     if (calibRow.visibility == View.VISIBLE) View.GONE else View.VISIBLE
             }
         }
-        top.addView(infoLabel)
+        topBar.addView(infoLabel)
         calibRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -304,10 +336,17 @@ class MainActivity : Activity() {
         }
         calibRow.addView(calibButton("UW FOV  −", -0.01f))
         calibRow.addView(calibButton("+", +0.01f))
-        top.addView(calibRow)
-        root.addView(top, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = dpi(24f) })
+        topBar.addView(calibRow)
+        recLabel = TextView(this).apply {
+            setTextColor(0xFFFF5252.toInt())
+            textSize = 15f
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+        }
+        topBar.addView(recLabel)
+        root.addView(topBar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = dpi(24f) })
 
-        // Bottom: zoom readout, chips, shutter
+        // Bottom: zoom readout, chips, mode switch, shutter
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -333,18 +372,25 @@ class MainActivity : Activity() {
         chip("2") { 2f }
         bottom.addView(chipRow, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dpi(10f) })
 
-        val shutter = View(this).apply {
-            background = circle(Color.WHITE, dpi(4f), 0xFF888888.toInt())
-            setOnClickListener { takePhoto() }
-        }
-        bottom.addView(shutter, LinearLayout.LayoutParams(dpi(72f), dpi(72f)).apply { topMargin = dpi(20f) })
-        root.addView(bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { bottomMargin = dpi(48f) })
+        val modeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        fun modeTab(label: String, video: Boolean) = TextView(this).apply {
+            text = label
+            textSize = 13f
+            setPadding(dpi(14f), dpi(8f), dpi(14f), dpi(8f))
+            setOnClickListener { setMode(video) }
+        }.also { modeRow.addView(it) }
+        photoTab = modeTab("PHOTO", false)
+        videoTab = modeTab("VIDEO", true)
+        bottom.addView(modeRow, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dpi(12f) })
+
+        shutter = View(this).apply { setOnClickListener { onShutter() } }
+        bottom.addView(shutter, LinearLayout.LayoutParams(dpi(72f), dpi(72f)).apply { topMargin = dpi(8f) })
+        root.addView(bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { bottomMargin = dpi(40f) })
 
         // Pinch to zoom anywhere that isn't a button
         val scaler = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(d: ScaleGestureDetector): Boolean {
                 zoomAnimator?.cancel()
-                afterSwitch = null
                 return true
             }
             override fun onScale(d: ScaleGestureDetector): Boolean {
@@ -358,11 +404,16 @@ class MainActivity : Activity() {
 
         textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
-                texture = st
                 maybeStartCamera()
             }
-            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {}
-            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean { texture = null; return true }
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
+                renderer?.setDisplaySize(width, height)
+            }
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                stopRecording()
+                stopCamera()
+                return true
+            }
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
         }
     }
@@ -382,6 +433,24 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun updateModeUi() {
+        val recording = recorder != null
+        photoTab.setTextColor(if (!videoMode) 0xFFFFD54F.toInt() else Color.WHITE)
+        videoTab.setTextColor(if (videoMode) 0xFFFFD54F.toInt() else Color.WHITE)
+        photoTab.alpha = if (recording) 0.3f else 1f
+        shutter.background = when {
+            recording -> GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(14f)
+                setColor(0xFFE53935.toInt())
+                setStroke(dpi(4f), Color.WHITE)
+            }
+            videoMode -> circle(0xFFE53935.toInt(), dpi(4f), Color.WHITE)
+            else -> circle(Color.WHITE, dpi(4f), 0xFF888888.toInt())
+        }
+        recLabel.visibility = if (recording) View.VISIBLE else View.GONE
+    }
+
     private fun nudgeUwBase(delta: Float) {
         val u = uwLens ?: return
         u.base = (u.base + delta).coerceIn(0.3f, 0.95f)
@@ -395,13 +464,7 @@ class MainActivity : Activity() {
     private fun setZoom(z: Float) {
         zoom = z.coerceIn(minZoom, maxZoom)
         zoomLabel.text = String.format(Locale.US, "%.2fx", zoom)
-        if (overlay.visibility == View.VISIBLE) {
-            // Keep the frozen frame following the pinch. Never shrink it below full size,
-            // which would show black borders.
-            val s = max(zoom / snapZoom, 1f)
-            overlay.scaleX = s
-            overlay.scaleY = s
-        }
+        renderer?.zoom = zoom
         latestZoom = zoom
         val h = cam ?: return
         if (zoomPosted.compareAndSet(false, true)) {
@@ -409,84 +472,37 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun runZoomAnim(target: Float, ms: Long, onEnd: (() -> Unit)?) {
-        zoomAnimator?.cancel()
-        val from = zoom
-        val lf = ln(from)
-        val lt = ln(target)
-        zoomAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = ms
-            interpolator = DecelerateInterpolator()
-            addUpdateListener { setZoom(exp(lf + (lt - lf) * (it.animatedValue as Float))) }
-            if (onEnd != null) addListener(object : AnimatorListenerAdapter() {
-                private var cancelled = false
-                override fun onAnimationCancel(a: Animator) { cancelled = true }
-                override fun onAnimationEnd(a: Animator) { if (!cancelled) onEnd() }
-            })
-            start()
-        }
-    }
-
-    /** Animate to a zoom stop. If it crosses the lens boundary, pause at the boundary until the new lens is live. */
+    /**
+     * Animate to a zoom stop. The animation runs straight through the lens boundary: the
+     * frozen frame keeps following the zoom while the other lens starts, so nothing pauses.
+     */
     private fun animateZoomTo(target: Float) {
         val t = target.coerceIn(minZoom, maxZoom)
-        afterSwitch = null
-        val canSwitch = uwLens != null && !nativeMode
-        val down = canSwitch && zoom >= SWITCH_DOWN && t < SWITCH_DOWN
-        val up = canSwitch && zoom < SWITCH_UP && t >= SWITCH_UP
-        if (!down && !up) {
-            runZoomAnim(t, 450, null)
-            return
-        }
-        val edge = if (down) SWITCH_DOWN - 0.005f else SWITCH_UP
-        runZoomAnim(edge, 160) {
-            val cont = { runZoomAnim(t, 380, null) }
-            afterSwitch = cont
-            // Safety net in case the switch never reports back.
-            ui.postDelayed({ if (afterSwitch === cont) { afterSwitch = null; cont() } }, 1500)
-        }
-    }
-
-    // ---------------------------------------------------------------- overlay / crossfade (UI thread)
-
-    private fun showSnapshot() {
-        fadeAnimator?.cancel()
-        blurAnimator?.cancel()
-        val bmp = textureView.bitmap ?: return
-        overlay.setImageBitmap(bmp)
-        snapZoom = zoom
-        overlay.scaleX = 1f
-        overlay.scaleY = 1f
-        overlay.alpha = 1f
-        overlay.visibility = View.VISIBLE
-        if (Build.VERSION.SDK_INT >= 31) {
-            val maxR = dp(6f)
-            blurAnimator = ValueAnimator.ofFloat(0.01f, maxR).apply {
-                duration = 150
-                addUpdateListener {
-                    val r = it.animatedValue as Float
-                    overlay.setRenderEffect(RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP))
-                }
-                start()
-            }
-        }
-    }
-
-    private fun onLensLive() {
-        afterSwitch?.let { afterSwitch = null; it() }
-        if (overlay.visibility != View.VISIBLE) return
-        blurAnimator?.cancel()
-        fadeAnimator = ValueAnimator.ofFloat(overlay.alpha, 0f).apply {
-            duration = 220
-            addUpdateListener { overlay.alpha = it.animatedValue as Float }
-            addListener(object : AnimatorListenerAdapter() {
-                override fun onAnimationEnd(a: Animator) {
-                    overlay.visibility = View.INVISIBLE
-                    overlay.setImageDrawable(null)
-                    if (Build.VERSION.SDK_INT >= 31) overlay.setRenderEffect(null)
-                }
-            })
+        zoomAnimator?.cancel()
+        val lf = ln(zoom)
+        val lt = ln(t)
+        zoomAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 450
+            interpolator = DecelerateInterpolator(1.5f)
+            addUpdateListener { setZoom(exp(lf + (lt - lf) * (it.animatedValue as Float))) }
             start()
+        }
+    }
+
+    private fun setMode(video: Boolean) {
+        if (recorder != null || video == videoMode) return
+        videoMode = video
+        updateModeUi()
+        cam?.post { camReopen() }
+    }
+
+    private fun onShutter() {
+        if (!videoMode) {
+            takePhoto()
+        } else if (recorder == null) {
+            startRecording()
+        } else {
+            stopRecording()
         }
     }
 
@@ -496,15 +512,26 @@ class MainActivity : Activity() {
         if (cam != null) return
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
         if (!textureView.isAvailable) return
+        val display = textureView.surfaceTexture ?: return
         val m = mainLens ?: return
-        texture = textureView.surfaceTexture
+
+        val startLens = if (!nativeMode && uwLens != null && zoom < SWITCH_UP) uwLens!! else m
+        val r = GlRenderer()
+        val st = r.start(display, textureView.width, textureView.height, aspectFor(startLens))
+        if (st == null) {
+            r.release()
+            infoLabel.text = "OpenGL setup failed."
+            return
+        }
+        r.zoom = zoom
+        renderer = r
+        camTexture = st
 
         val t = HandlerThread("camera").also { it.start() }
         camThread = t
         val h = Handler(t.looper)
         cam = h
         latestZoom = zoom
-        val startLens = if (!nativeMode && uwLens != null && zoom < SWITCH_UP) uwLens!! else m
         h.post {
             switching = true
             openLens(startLens)
@@ -519,12 +546,17 @@ class MainActivity : Activity() {
         h.post {
             generation++
             closeCameraInternal()
+            jpegReaders.values.forEach { try { it.close() } catch (_: Exception) {} }
+            jpegReaders.clear()
             switching = false
             currentLens = null
         }
         t?.quitSafely()
         try { t?.join(1500) } catch (_: InterruptedException) {}
         zoomPosted.set(false)
+        renderer?.release()
+        renderer = null
+        camTexture = null
     }
 
     private fun chooseLens(z: Float, current: Lens): Lens {
@@ -540,12 +572,13 @@ class MainActivity : Activity() {
 
     private fun camApplyZoom() {
         val lens = currentLens ?: return
-        if (switching) return
         val want = chooseLens(latestZoom, lens)
         if (want !== lens) {
-            startSwitch(want)
+            // A switch already in flight finishes first; the settle callback calls us again.
+            if (!switching) startSwitch(want)
             return
         }
+        // Keep the crop in sync even while the new lens is settling, so the crossfade matches.
         val b = previewBuilder ?: return
         val s = session ?: return
         applyZoom(b, lens, latestZoom)
@@ -558,10 +591,17 @@ class MainActivity : Activity() {
 
     private fun startSwitch(want: Lens) {
         switching = true
-        // Freeze the current frame on screen before the old camera goes away.
-        val latch = CountDownLatch(1)
-        ui.post { showSnapshot(); latch.countDown() }
-        try { latch.await(250, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
+        renderer?.freeze(aspectFor(want))
+        closeCameraInternal()
+        openLens(want)
+    }
+
+    /** Restart the current lens, e.g. for a photo/video mode change (different stream size). */
+    private fun camReopen() {
+        val lens = currentLens ?: return
+        val want = chooseLens(latestZoom, lens)
+        switching = true
+        renderer?.freeze(aspectFor(want))
         closeCameraInternal()
         openLens(want)
     }
@@ -581,12 +621,10 @@ class MainActivity : Activity() {
     }
 
     private fun closeCameraInternal() {
-        try { session?.close() } catch (_: Exception) {}
+        // Closing the device tears down its session too; skipping session.close() saves a round trip.
         session = null
         try { device?.close() } catch (_: Exception) {}
         device = null
-        try { jpegReader?.close() } catch (_: Exception) {}
-        jpegReader = null
         previewSurface?.release()
         previewSurface = null
         previewBuilder = null
@@ -610,47 +648,63 @@ class MainActivity : Activity() {
                 override fun onError(d: CameraDevice, error: Int) {
                     d.close()
                     if (device === d) device = null
+                    if (gen != generation) return
                     switching = false
                     toast("Camera ${lens.id} error $error")
-                    ui.post { onLensLive() }
+                    renderer?.fadeOut(FADE_MS)
                 }
             }, cam)
         } catch (e: Exception) {
             Log.e(TAG, "openCamera ${lens.id} failed", e)
             switching = false
             toast("Can't open camera ${lens.id}: ${e.message}")
-            ui.post { onLensLive() }
+            renderer?.fadeOut(FADE_MS)
+        }
+    }
+
+    private fun jpegReaderFor(lens: Lens): ImageReader = jpegReaders.getOrPut(lens.id) {
+        ImageReader.newInstance(lens.jpegSize.width, lens.jpegSize.height, ImageFormat.JPEG, 2).apply {
+            setOnImageAvailableListener({ r ->
+                val img = r.acquireNextImage() ?: return@setOnImageAvailableListener
+                val buf = img.planes[0].buffer
+                val bytes = ByteArray(buf.remaining())
+                buf.get(bytes)
+                img.close()
+                saveJpeg(bytes)
+            }, cam)
         }
     }
 
     private fun createSession(d: CameraDevice, lens: Lens, gen: Int) {
-        val st = texture ?: return
-        st.setDefaultBufferSize(lens.previewSize.width, lens.previewSize.height)
+        val st = camTexture ?: return
+        val video = videoMode
+        val size = if (video) lens.videoPreview else lens.photoPreview
+        st.setDefaultBufferSize(size.width, size.height)
         val surf = Surface(st)
         previewSurface = surf
 
-        val reader = ImageReader.newInstance(lens.jpegSize.width, lens.jpegSize.height, ImageFormat.JPEG, 2)
-        reader.setOnImageAvailableListener({ r ->
-            val img = r.acquireNextImage() ?: return@setOnImageAvailableListener
-            val buf = img.planes[0].buffer
-            val bytes = ByteArray(buf.remaining())
-            buf.get(bytes)
-            img.close()
-            saveJpeg(bytes)
-        }, cam)
-        jpegReader = reader
+        // Video frames reach the encoder through GlRenderer, so video sessions only need the preview.
+        val outputs = mutableListOf(surf)
+        if (!video) outputs.add(jpegReaderFor(lens).surface)
 
         try {
             @Suppress("DEPRECATION")
-            d.createCaptureSession(listOf(surf, reader.surface), object : CameraCaptureSession.StateCallback() {
+            d.createCaptureSession(outputs, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     if (gen != generation) { s.close(); return }
                     session = s
-                    val b = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                    sessionIsVideo = video
+                    val b = d.createCaptureRequest(
+                        if (video) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+                    )
                     b.addTarget(surf)
-                    if (lens.afContinuous) {
-                        b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    when {
+                        video && lens.afVideo ->
+                            b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                        lens.afPicture ->
+                            b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                     }
+                    if (video) lens.fps30?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
                     previewBuilder = b
                     framesAfterSwitch = 0
                     applyZoom(b, lens, latestZoom)
@@ -661,31 +715,33 @@ class MainActivity : Activity() {
                     }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
+                    if (gen != generation) return
                     switching = false
                     toast("Couldn't configure camera ${lens.id}")
-                    ui.post { onLensLive() }
+                    renderer?.fadeOut(FADE_MS)
                 }
             }, cam)
         } catch (e: Exception) {
             Log.e(TAG, "createCaptureSession failed", e)
             switching = false
-            ui.post { onLensLive() }
+            renderer?.fadeOut(FADE_MS)
         }
     }
 
     private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult) {
-            if (!switching) return
+            if (!switching || s !== session) return
             framesAfterSwitch++
             val ae = result.get(CaptureResult.CONTROL_AE_STATE)
             val settled = ae == null ||
                 ae == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
                 ae == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
                 ae == CaptureResult.CONTROL_AE_STATE_LOCKED
-            // Wait for a few frames and settled exposure so the crossfade doesn't reveal a dark/bright flash.
-            if ((framesAfterSwitch >= 3 && settled) || framesAfterSwitch >= 12) {
+            // A couple of frames with settled exposure (or a short cap) so the crossfade doesn't
+            // reveal a dark/bright flash. The fade itself hides any remaining small AE drift.
+            if ((framesAfterSwitch >= 2 && settled) || framesAfterSwitch >= 8) {
                 switching = false
-                ui.post { onLensLive() }
+                renderer?.fadeOut(FADE_MS)
                 camApplyZoom() // zoom may have moved on (or back) while we were switching
             }
         }
@@ -703,12 +759,13 @@ class MainActivity : Activity() {
         val d = device ?: return
         val s = session ?: return
         val lens = currentLens ?: return
-        val r = jpegReader ?: return
+        if (sessionIsVideo) return
+        val r = jpegReaders[lens.id] ?: return
         if (switching) { toast("Switching lenses, try again"); return }
         try {
             val b = d.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             b.addTarget(r.surface)
-            if (lens.afContinuous) {
+            if (lens.afPicture) {
                 b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             }
             b.set(CaptureRequest.JPEG_ORIENTATION, lens.sensorOrientation)
@@ -721,11 +778,12 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun stamp() = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+
     private fun saveJpeg(bytes: ByteArray) {
         try {
-            val name = "SmoothZoom_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
             val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                put(MediaStore.Images.Media.DISPLAY_NAME, "SmoothZoom_${stamp()}.jpg")
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                 put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/SmoothZoom")
             }
@@ -736,6 +794,100 @@ class MainActivity : Activity() {
             Log.e(TAG, "save failed", e)
             toast("Save failed: ${e.message}")
         }
+    }
+
+    // ---------------------------------------------------------------- video (UI thread)
+
+    private val recTick = object : Runnable {
+        override fun run() {
+            val s = (SystemClock.elapsedRealtime() - recStart) / 1000
+            recLabel.text = String.format(Locale.US, "● %02d:%02d", s / 60, s % 60)
+            ui.postDelayed(this, 500)
+        }
+    }
+
+    private fun startRecording() {
+        val r = renderer ?: return
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, "SmoothZoom_${stamp()}.mp4")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/SmoothZoom")
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+        val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+        if (uri == null) { toast("Can't create video file"); return }
+
+        var pfd: ParcelFileDescriptor? = null
+        var surface: Surface? = null
+        var rec: MediaRecorder? = null
+        try {
+            pfd = contentResolver.openFileDescriptor(uri, "w") ?: error("no file descriptor")
+            surface = MediaCodec.createPersistentInputSurface()
+            val audio = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            rec = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else @Suppress("DEPRECATION") MediaRecorder()
+            rec.apply {
+                if (audio) setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
+                setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setOutputFile(pfd.fileDescriptor)
+                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                setVideoSize(ENC_W, ENC_H)
+                setVideoFrameRate(30)
+                setVideoEncodingBitRate(16_000_000)
+                if (audio) {
+                    setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                    setAudioSamplingRate(48_000)
+                    setAudioEncodingBitRate(192_000)
+                    setAudioChannels(2)
+                }
+                // Frames are rendered landscape; players rotate them back to portrait.
+                setOrientationHint(90)
+                setInputSurface(surface)
+                prepare()
+                start()
+            }
+            r.setEncoder(surface, ENC_W, ENC_H)
+        } catch (e: Exception) {
+            Log.e(TAG, "start recording failed", e)
+            try { rec?.release() } catch (_: Exception) {}
+            surface?.release()
+            try { pfd?.close() } catch (_: Exception) {}
+            contentResolver.delete(uri, null, null)
+            toast("Can't record: ${e.message}")
+            return
+        }
+        recorder = rec
+        recSurface = surface
+        recPfd = pfd
+        recUri = uri
+        recStart = SystemClock.elapsedRealtime()
+        ui.post(recTick)
+        updateModeUi()
+    }
+
+    private fun stopRecording() {
+        val rec = recorder ?: return
+        recorder = null
+        ui.removeCallbacks(recTick)
+        renderer?.setEncoder(null, 0, 0)
+        val ok = try { rec.stop(); true } catch (e: RuntimeException) { false }
+        rec.release()
+        recSurface?.release()
+        recSurface = null
+        try { recPfd?.close() } catch (_: Exception) {}
+        recPfd = null
+        val uri = recUri
+        recUri = null
+        if (uri != null) {
+            if (ok) {
+                contentResolver.update(uri, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
+                toast("Video saved to DCIM/SmoothZoom")
+            } else {
+                contentResolver.delete(uri, null, null)
+                toast("Recording too short")
+            }
+        }
+        updateModeUi()
     }
 
     private fun toast(msg: String) {
